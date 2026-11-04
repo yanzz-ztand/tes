@@ -1,0 +1,211 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/snapdl/simple
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "SnapDL"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.snapdl.simple'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.snapdl.simple'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28"/>
+              <application
+                  android:label="SnapDL"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/snapdl/simple/MainActivity.kt <<'EOF'
+          package com.snapdl.simple
+
+          import android.app.Activity
+          import android.app.DownloadManager
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.widget.*
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private val API = "https://api.v02.savethevideo.com/tasks"
+
+              private fun call(method: String, url: String, body: String?): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.requestMethod = method
+                  c.connectTimeout = 20000
+                  c.readTimeout = 30000
+                  c.setRequestProperty("Accept", "application/json")
+                  if (body != null) {
+                      c.doOutput = true
+                      c.setRequestProperty("Content-Type", "application/json")
+                      c.outputStream.use { it.write(body.toByteArray()) }
+                  }
+                  return c.inputStream.bufferedReader().readText()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 80, 32, 32)
+                  }
+                  val input = EditText(this).apply {
+                      hint = "Tempel link TikTok"
+                      setSingleLine()
+                  }
+                  val go = Button(this).apply { text = "Ambil" }
+                  val status = TextView(this).apply { setPadding(0, 24, 0, 24) }
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val scroll = ScrollView(this).apply { addView(list) }
+
+                  root.addView(input)
+                  root.addView(go)
+                  root.addView(status)
+                  root.addView(scroll)
+                  setContentView(root)
+
+                  go.setOnClickListener {
+                      val link = input.text.toString().trim()
+                      if (link.isEmpty()) return@setOnClickListener
+                      status.text = "Memproses..."
+                      list.removeAllViews()
+
+                      thread {
+                          try {
+                              val reqBody = JSONObject().put("type", "info").put("url", link).toString()
+                              var j = JSONObject(call("POST", API, reqBody))
+                              var n = 0
+                              while (j.optString("state") != "completed" && n++ < 20) {
+                                  if (j.optString("state") == "failed") throw Exception("Task gagal")
+                                  Thread.sleep(1500)
+                                  j = JSONObject(call("GET", API + "/" + j.getString("id"), null))
+                              }
+                              val v = j.getJSONArray("result").getJSONObject(0)
+                              val vid = v.optString("id", "video")
+                              val fm = v.getJSONArray("formats")
+                              val seen = HashSet<String>()
+                              val items = ArrayList<Triple<String, String, String>>()
+
+                              for (i in 0 until fm.length()) {
+                                  val f = fm.getJSONObject(i)
+                                  val key = f.getString("format_id").replace(Regex("-\\d+$"), "")
+                                  if (!seen.add(key)) continue
+                                  val isAudio = f.optString("vcodec") == "none"
+                                  val mb = f.optLong("filesize", 0) / 1_000_000.0
+                                  val label = (if (isAudio) "MP3 (audio)"
+                                               else f.optString("resolution") + " " + f.optString("vcodec")) +
+                                               (if (mb > 0) String.format("  %.1f MB", mb) else "")
+                                  items.add(Triple(label, f.getString("url"), f.optString("ext", "mp4")))
+                              }
+
+                              runOnUiThread {
+                                  status.text = v.optString("title")
+                                  for ((label, url, ext) in items) {
+                                      list.addView(Button(this).apply {
+                                          text = label
+                                          setOnClickListener {
+                                              val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                              val r = DownloadManager.Request(Uri.parse(url))
+                                                  .addRequestHeader("Referer", "https://www.tiktok.com/")
+                                                  .setNotificationVisibility(
+                                                      DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                                  .setDestinationInExternalPublicDir(
+                                                      Environment.DIRECTORY_DOWNLOADS, "$vid.$ext")
+                                              dm.enqueue(r)
+                                              Toast.makeText(this@MainActivity,
+                                                  "Mengunduh ke folder Download", Toast.LENGTH_SHORT).show()
+                                          }
+                                      })
+                                  }
+                              }
+                          } catch (e: Exception) {
+                              runOnUiThread { status.text = "Error: " + e.message }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SnapDL-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
